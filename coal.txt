@@ -1,0 +1,2156 @@
+INCLUDE Irvine32.inc
+
+MAX_PROCESSES   = 20
+MAX_SEGMENTS    = 600           ; max Gantt segments per run
+MAX_HISTORY     = 10            ; stored individual runs
+MAX_PRIORITY    = 10
+MAX_PID         = 999
+MAX_ARRIVAL     = 100
+MAX_BURST       = 25
+MAX_QUANTUM     = 50
+IDLE_PID        = -1            ; pseudo PID for IDLE segments
+NOT_STARTED     = -1            ; "never ran yet" marker
+DEFAULT_THRESHOLD = 10          ; default starvation threshold
+
+ALG_FCFS        = 1
+ALG_RR          = 2
+ALG_PRIORITY    = 3
+ALG_SRTF        = 4
+
+NUM_SLOTS       = MAX_HISTORY + 2
+CMP_SLOT_A      = MAX_HISTORY
+CMP_SLOT_B      = MAX_HISTORY + 1
+
+COL_W           = 6             ; (legacy) padded column width
+TBL_W           = 7             ; inner width of every table cell
+GANTT_W         = 6             ; inner width of every Gantt cell
+GANTT_PER_LINE  = 10            ; Gantt cells per console line
+MENU_EXIT       = 7
+
+WL_INT_N        = 8             ; processes per workload template
+WL_BATCH_N      = 5
+WL_MIX_N        = 8
+
+NL              EQU <0dh,0ah>
+
+; ---------------------------------------------------------------------
+; Macros
+; ---------------------------------------------------------------------
+PrintMsg MACRO msgName          ; print a zero-terminated string
+    push edx
+    mov  edx, OFFSET msgName
+    call WriteString
+    pop  edx
+ENDM
+
+SetColor MACRO colorVal         ; change text color
+    push eax
+    mov  eax, colorVal
+    call SetTextColor
+    pop  eax
+ENDM
+
+PrintColored MACRO msgName, colorVal    ; print a string in a color, then reset to white
+    SetColor colorVal
+    PrintMsg msgName
+    SetColor white
+ENDM
+
+ShowMenu MACRO titleMsg, menuMsg        ; clear screen, yellow title, menu text
+    call Clrscr
+    PrintColored titleMsg, yellow
+    PrintMsg menuMsg
+ENDM
+
+Bar MACRO                       ; print a vertical border '|'
+    push eax
+    mov  al, '|'
+    call WriteChar
+    pop  eax
+ENDM
+
+CellNum MACRO value, wid        ; centred number in a bordered cell, then '|'
+    mov  eax, value
+    mov  ebx, wid
+    call PrintCenterNum
+ENDM
+
+CellStr MACRO msgName, wid      ; centred string in a bordered cell, then '|'
+    mov  edx, OFFSET msgName
+    mov  ebx, wid
+    call PrintCenterStr
+ENDM
+
+Border MACRO widArr, cnt        ; +-----+-----+ line for cnt columns
+    push esi
+    push ecx
+    mov  esi, OFFSET widArr
+    mov  ecx, cnt
+    call PrintBorder
+    pop  ecx
+    pop  esi
+ENDM
+
+FillArr MACRO arr, val          ; set procCount DWORDs of arr to val
+    mov  eax, val
+    mov  edi, OFFSET arr
+    mov  ecx, procCount
+    rep  stosd
+ENDM
+
+CopyDwords MACRO src, dst, rowOff, cnt  ; copy cnt DWORDs of src into dst at byte offset rowOff
+    mov  esi, OFFSET src
+    lea  edi, dst[rowOff]
+    mov  ecx, cnt
+    rep  movsd
+ENDM
+
+ShiftLeft MACRO arr             ; move arr[EBX+1 .. ] one place left (EDX = element count)
+    lea  esi, arr[ebx*4 + 4]
+    lea  edi, arr[ebx*4]
+    mov  ecx, edx
+    rep  movsd
+ENDM
+
+; ---------------------------------------------------------------------
+; Prototypes
+; ---------------------------------------------------------------------
+ReadRange       PROTO, pPrompt:PTR BYTE, minVal:SDWORD, maxVal:SDWORD
+SelectAlgorithm PROTO, pPrompt:PTR BYTE
+
+.data
+; ===================== ORIGINAL DATASET =============================
+; Parallel arrays: element i of each array describes process i.
+; (The four arrays must stay contiguous - ClearProcesses relies on it.)
+procCount   DWORD 0
+pidArr      DWORD MAX_PROCESSES DUP(0)          ; process IDs
+atArr       DWORD MAX_PROCESSES DUP(0)          ; arrival times
+btArr       DWORD MAX_PROCESSES DUP(0)          ; burst times
+priArr      DWORD MAX_PROCESSES DUP(0)          ; priorities
+
+; ===================== WORKING STATE (per run) ======================
+remArr      DWORD MAX_PROCESSES DUP(0)          ; remaining burst
+startArr    DWORD MAX_PROCESSES DUP(NOT_STARTED); first start time
+ctArr       DWORD MAX_PROCESSES DUP(0)          ; completion time
+doneArr     DWORD MAX_PROCESSES DUP(0)          ; 1 = finished
+admitArr    DWORD MAX_PROCESSES DUP(0)          ; 1 = already in RR queue
+rq          DWORD MAX_PROCESSES DUP(0)          ; RR circular queue
+rqHead      DWORD 0
+rqTail      DWORD 0
+rqCount     DWORD 0
+
+gCount      DWORD 0                             ; Gantt of current run
+gPid        DWORD MAX_SEGMENTS DUP(0)
+gStart      DWORD MAX_SEGMENTS DUP(0)
+gEnd        DWORD MAX_SEGMENTS DUP(0)
+segOverflow DWORD 0                             ; 1 = Gantt array was full
+
+clockT      DWORD 0                             ; simulation clock
+finishedCnt DWORD 0
+lastIdx     DWORD -1                            ; process that ran last tick
+preferFlag  DWORD 0                             ; 1 = running process wins ties
+metricBase  DWORD 0                             ; key array for selection
+curAlg      DWORD 0
+rrQuantum   DWORD 2
+algA        DWORD 0
+algB        DWORD 0
+editIdx     DWORD 0                             ; process being added/updated
+
+; ===================== RESULT SLOTS =================================
+; 2-D data stored flat: element (slot,i) is at index slot*ROW + i.
+histSerial  DWORD 0                             ; runs executed so far
+lastSlot    DWORD 0                             ; slot of latest run
+cmpValid    DWORD 0                             ; 1 = comparison stored
+
+slotAlg     DWORD NUM_SLOTS DUP(0)
+slotQuantum DWORD NUM_SLOTS DUP(0)
+slotN       DWORD NUM_SLOTS DUP(0)
+slotSegCnt  DWORD NUM_SLOTS DUP(0)
+slotOvf     DWORD NUM_SLOTS DUP(0)
+slotSerial  DWORD NUM_SLOTS DUP(0)
+
+slotPid     DWORD (NUM_SLOTS*MAX_PROCESSES) DUP(0)
+slotAt      DWORD (NUM_SLOTS*MAX_PROCESSES) DUP(0)
+slotBt      DWORD (NUM_SLOTS*MAX_PROCESSES) DUP(0)
+slotPri     DWORD (NUM_SLOTS*MAX_PROCESSES) DUP(0)
+slotCt      DWORD (NUM_SLOTS*MAX_PROCESSES) DUP(0)
+slotStart   DWORD (NUM_SLOTS*MAX_PROCESSES) DUP(0)
+
+slotGPid    DWORD (NUM_SLOTS*MAX_SEGMENTS) DUP(0)
+slotGStart  DWORD (NUM_SLOTS*MAX_SEGMENTS) DUP(0)
+slotGEnd    DWORD (NUM_SLOTS*MAX_SEGMENTS) DUP(0)
+
+; ===================== METRIC SCRATCH ===============================
+mPid DWORD 0
+mAT  DWORD 0
+mBT  DWORD 0
+mPri DWORD 0
+mCT  DWORD 0
+mTAT DWORD 0
+mWT  DWORD 0
+mRT  DWORD 0
+sumWT   DWORD 0
+sumTAT  DWORD 0
+sumRT   DWORD 0
+avgWT   DWORD 0                 ; averages x100 (fixed point)
+avgTAT  DWORD 0
+avgRT   DWORD 0
+cmpAWT  DWORD 0                 ; averages of algorithm A (comparison)
+cmpATAT DWORD 0
+cmpART  DWORD 0
+rowA    DWORD 0
+rowB    DWORD 0
+chunkEnd DWORD 0
+
+; analyzer scratch
+aBusy    DWORD 0
+aIdle    DWORD 0
+aElapsed DWORD 0
+aSwitch  DWORD 0
+starveThreshold DWORD DEFAULT_THRESHOLD
+starveCount     DWORD 0
+
+; ===================== TABLE COLUMN WIDTHS ==========================
+wProc     DWORD 4 DUP(TBL_W)                    ; PID AT BT PRI
+wMetrics  DWORD 8 DUP(TBL_W)                    ; PID AT BT PRI CT TAT WT RT
+wStarve   DWORD TBL_W, TBL_W, 18                ; PID WT Status
+wGantt    DWORD GANTT_PER_LINE DUP(GANTT_W)     ; one entry per Gantt cell
+wCmp      DWORD 16, 12, 12, 10                  ; Metric A B Better
+chunkStart DWORD 0
+
+; ===================== JUMP TABLES ==================================
+menuTable   DWORD OFFSET IndividualSimulation
+            DWORD OFFSET CompareAlgorithms
+            DWORD OFFSET ProcessManagement
+            DWORD OFFSET GenerateWorkload
+            DWORD OFFSET ViewPreviousResults
+            DWORD OFFSET CPUPerformanceAnalyzer
+
+pmTable     DWORD OFFSET AddProcess
+            DWORD OFFSET UpdateProcess
+            DWORD OFFSET DeleteProcess
+            DWORD OFFSET DisplayProcesses
+            DWORD OFFSET ClearProcesses
+
+wlActions   DWORD OFFSET ProcessManagement      ; workload menu options 4..6
+            DWORD OFFSET IndividualSimulation
+            DWORD OFFSET CompareAlgorithms
+
+algTable    DWORD OFFSET RunFCFS
+            DWORD OFFSET RunRoundRobin
+            DWORD OFFSET RunPriority
+            DWORD OFFSET RunSRTF
+
+algNames    DWORD OFFSET nFCFS, OFFSET nRR, OFFSET nPRI, OFFSET nSRTF
+shortNames  DWORD OFFSET sFCFS, OFFSET sRR, OFFSET sPRI, OFFSET sSRTF
+
+; ===================== WORKLOAD TEMPLATES ===========================
+; each process = 4 DWORDs: PID, Arrival, Burst, Priority
+wlInteractive DWORD 1,0,2,3,  2,1,3,1,  3,2,1,4,  4,3,2,2
+              DWORD 5,4,4,5,  6,5,2,2,  7,6,3,1,  8,8,1,3
+wlBatch       DWORD 1,0,20,4, 2,2,15,2, 3,5,25,3, 4,8,18,1, 5,12,22,5
+wlMixed       DWORD 1,0,24,3, 2,1,3,1,  3,3,10,4, 4,4,2,2
+              DWORD 5,6,18,5, 6,10,4,1, 7,12,12,3, 8,15,1,2
+
+wlAddr        DWORD OFFSET wlInteractive, OFFSET wlBatch, OFFSET wlMixed
+wlCount       DWORD WL_INT_N, WL_BATCH_N, WL_MIX_N
+
+; ===================== STRINGS ======================================
+nFCFS   BYTE "First Come First Serve (FCFS)",0
+nRR     BYTE "Round Robin (RR)",0
+nPRI    BYTE "Priority Preemptive",0
+nSRTF   BYTE "Shortest Remaining Time First (SRTF)",0
+sFCFS   BYTE "FCFS",0
+sRR     BYTE "RR",0
+sPRI    BYTE "Priority",0
+sSRTF   BYTE "SRTF",0
+sIdle   BYTE "IDLE",0
+
+txtMainTitle BYTE "=====================================",NL
+             BYTE "        CPU SCHEDULER CHALLENGE",NL
+             BYTE "=====================================",NL,0
+txtMainMenu  BYTE " 1. Individual Algorithm Simulation",NL
+             BYTE " 2. Compare Two Algorithms",NL
+             BYTE " 3. Process Management",NL
+             BYTE " 4. Workload Scenario Simulator",NL
+             BYTE " 5. View Previous Results",NL
+             BYTE " 6. CPU Performance Analyzer",NL
+             BYTE " 7. Exit",NL,NL,0
+prChoice     BYTE "Enter your choice: ",0
+txtBad1      BYTE "Invalid input! Enter a whole number from ",0
+txtBad2      BYTE " to ",0
+txtBad3      BYTE ".",NL,0
+txtBye       BYTE NL,"Thank you for using CPU Scheduler Challenge. Goodbye!",NL,0
+
+txtPMTitle   BYTE "---------- PROCESS MANAGEMENT ----------",NL,0
+txtPMMenu    BYTE " 1. Add Process",NL
+             BYTE " 2. Update Process",NL
+             BYTE " 3. Delete Process",NL
+             BYTE " 4. View Processes",NL
+             BYTE " 5. Clear Process Data",NL
+             BYTE " 6. Back to Main Menu",NL,NL,0
+prPid        BYTE "Process ID (1-999): ",0
+prAt         BYTE "Arrival time (0-100): ",0
+prBt         BYTE "Burst time (1-25): ",0
+prPri        BYTE "Priority (1-10, 1 = highest): ",0
+prPidSel     BYTE "Enter the ID of the process: ",0
+prNewPid     BYTE "New process ID (1-999): ",0
+txtFull      BYTE "Process table is full (maximum 20 processes).",NL,0
+txtDup       BYTE "That process ID already exists. Use a unique ID.",NL,0
+txtAdded     BYTE "Process added successfully.",NL,0
+txtUpdated   BYTE "Process updated successfully.",NL,0
+txtDeleted   BYTE "Process deleted successfully.",NL,0
+txtNotFound  BYTE "No process with that ID exists.",NL,0
+txtNoProc    BYTE "No processes are stored.",NL,0
+txtConfirm   BYTE "Delete ALL processes? (y/n): ",0
+txtCleared   BYTE "All process data cleared.",NL,0
+txtCancelled BYTE "Cancelled.",NL,0
+hPID BYTE "PID",0
+hAT BYTE "AT",0
+hBT BYTE "BT",0
+hPRI BYTE "PRI",0
+hCT BYTE "CT",0
+hTAT BYTE "TAT",0
+hWT BYTE "WT",0
+hRT BYTE "RT",0
+hStatus BYTE "Status",0
+hMetric BYTE "Metric",0
+hBetter BYTE "Better",0
+
+txtIndTitle  BYTE "------ INDIVIDUAL ALGORITHM SIMULATION ------",NL,0
+txtCmpTitle  BYTE "-------- COMPARE TWO ALGORITHMS --------",NL,0
+txtNoData    BYTE "No process data. Add processes in Process Management first.",NL,0
+algMenu      BYTE NL,"  1. First Come First Serve (FCFS)   [non-preemptive]",NL
+             BYTE "  2. Round Robin (RR)                [preemptive]",NL
+             BYTE "  3. Priority Preemptive             [preemptive]",NL
+             BYTE "  4. Shortest Remaining Time (SRTF)  [preemptive]",NL
+             BYTE "  5. Cancel / Back",NL,NL,0
+prAlgPick    BYTE "Select an algorithm: ",0
+prFirst      BYTE "Select the FIRST algorithm: ",0
+prSecond     BYTE "Select the SECOND algorithm: ",0
+prQuantum    BYTE "Enter time quantum (1-50): ",0
+txtSame      BYTE "The two algorithms must be different. Choose again.",NL,0
+txtSaved     BYTE "Result stored in session history as run #",0
+txtReplace   BYTE "History is full: replacing the oldest stored run, run #",0
+txtAlgLabel  BYTE "Algorithm: ",0
+txtQuantum   BYTE "  (Time quantum = ",0
+txtCloseP    BYTE ")",0
+txtGanttHdr  BYTE NL,"GANTT CHART",NL,0
+hdrMetrics   BYTE NL,"PROCESS METRICS",NL,0
+txtAvgWT     BYTE "Average Waiting Time    (WT)  = ",0
+txtAvgTAT    BYTE "Average Turnaround Time (TAT) = ",0
+txtAvgRT     BYTE "Average Response Time   (RT)  = ",0
+txtOvf       BYTE "Warning: Gantt segment array was full; chart is truncated.",NL,0
+txtFirstAlg  BYTE NL,"=========== FIRST ALGORITHM ===========",NL,0
+txtSecondAlg BYTE NL,"=========== SECOND ALGORITHM ===========",NL,0
+txtCmpHdr    BYTE NL,"=========== COMPARISON TABLE ===========",NL,0
+txtLowerHdr  BYTE "Lower value is better for every metric.",NL,0
+lblAvgWT     BYTE "Average WT",0
+lblAvgTAT    BYTE "Average TAT",0
+lblAvgRT     BYTE "Average RT",0
+txtTie       BYTE "Tie",0
+txtNote      BYTE NL,"Note: no algorithm is universally best. The better choice depends",NL
+             BYTE "on the workload and on which metric matters (waiting, turnaround",NL
+             BYTE "or response time).",NL,0
+
+txtWLTitle   BYTE "------ WORKLOAD SCENARIO SIMULATOR ------",NL,0
+txtWLMenu    BYTE " 1. Generate Interactive workload (many short bursts)",NL
+             BYTE " 2. Generate Batch workload (long bursts)",NL
+             BYTE " 3. Generate Mixed workload (short + long, varied priority)",NL
+             BYTE " 4. Review / edit current processes",NL
+             BYTE " 5. Run an algorithm on current data",NL
+             BYTE " 6. Compare two algorithms on current data",NL
+             BYTE " 7. Back to Main Menu",NL,NL,0
+txtOverwrite BYTE "This replaces the current process data. Continue? (y/n): ",0
+txtGenerated BYTE "Workload generated (nothing has been executed).",NL,0
+
+txtPrevTitle BYTE "------ PREVIOUS RESULTS ------",NL,0
+txtPrevMenu  BYTE " 1. View most recent individual run",NL
+             BYTE " 2. View an earlier individual run",NL
+             BYTE " 3. View most recent comparison",NL
+             BYTE " 4. Back to Main Menu",NL,NL,0
+txtNoRuns    BYTE "No individual run has been stored yet.",NL,0
+txtNoCmp     BYTE "No comparison has been stored yet.",NL,0
+hdrRuns      BYTE "Stored individual runs:",NL,0
+txtRunNo     BYTE "  Run #",0
+txtColon     BYTE ": ",0
+txtProcsOf   BYTE "  (",0
+txtProcsEnd  BYTE " processes)",NL,0
+prRunNo      BYTE "Enter run number to view: ",0
+txtRunGone   BYTE "That run is no longer stored (it was replaced).",NL,0
+
+txtAnTitle   BYTE "------ CPU PERFORMANCE ANALYZER ------",NL,0
+txtAnMenu    BYTE " 1. Analyze Last Run Algorithm",NL
+             BYTE " 2. Analyze Previous Algorithm Run",NL
+             BYTE " 3. Analyze Last Comparison",NL
+             BYTE " 4. Return to Main Menu",NL,NL,0
+prThreshold  BYTE "Starvation threshold (waiting time limit, 1-999): ",0
+txtAnHeader  BYTE NL,"CPU ANALYSIS (from stored results, nothing re-run)",NL,0
+lblBusy      BYTE "CPU Busy Time        : ",0
+lblIdle      BYTE "CPU Idle Time        : ",0
+lblElapsed   BYTE "Total Elapsed Time   : ",0
+lblSwitch    BYTE "Context Switches     : ",0
+lblUtil      BYTE "CPU Utilization      : ",0
+lblThru      BYTE "Throughput           : ",0
+txtPercent   BYTE " %",NL,0
+txtPerUnit   BYTE " processes per time unit",NL,0
+txtCheckOk   BYTE "Check: Busy + Idle = Elapsed  ->  OK",NL,0
+txtCheckBad  BYTE "Check: Busy + Idle <> Elapsed (Gantt may be truncated)",NL,0
+hdrStarve    BYTE NL,"STARVATION INDICATOR",NL,0
+txtStarveYes BYTE "WAITING TOO LONG",0
+txtStarveNo  BYTE "ok",0
+txtFlagged   BYTE "Processes flagged: ",0
+txtAnExplain BYTE NL,"Notes:",NL
+             BYTE " - Utilization = Busy / Elapsed x 100; elapsed starts at time 0.",NL
+             BYTE " - Context switches count process-to-different-process transitions;",NL
+             BYTE "   changes to or from IDLE are not counted.",NL
+             BYTE " - Starvation is an INDICATOR (waiting time above the threshold),",NL
+             BYTE "   not proof that a process can never run.",NL,0
+txtNoRunAn   BYTE "No individual run is available to analyze.",NL,0
+txtNoCmpAn   BYTE "No comparison is available to analyze.",NL,0
+
+.code
+
+; =====================================================================
+;                              MAIN
+; =====================================================================
+; main: show the main menu and dispatch through menuTable until Exit.
+main PROC
+MainLoop:
+    ShowMenu txtMainTitle, txtMainMenu
+    INVOKE  ReadRange, ADDR prChoice, 1, MENU_EXIT
+    cmp     eax, MENU_EXIT
+    je      ExitProgram
+    dec     eax                          ; choice -> table index
+    call    DWORD PTR menuTable[eax*4]
+    jmp     MainLoop
+ExitProgram:
+    PrintColored txtBye, lightGreen
+    exit
+main ENDP
+
+; =====================================================================
+;                         INPUT / OUTPUT HELPERS
+; =====================================================================
+
+; ReadRange: ask until a whole number in [minVal, maxVal] is entered.
+; Returns EAX = value. (ReadInt sets the Overflow flag on bad input.)
+ReadRange PROC USES edx, pPrompt:PTR BYTE, minVal:SDWORD, maxVal:SDWORD
+RG_Retry:
+    mov     edx, pPrompt
+    call    WriteString
+    call    ReadInt
+    jo      RG_Bad
+    cmp     eax, minVal
+    jl      RG_Bad
+    cmp     eax, maxVal
+    jg      RG_Bad
+    ret
+RG_Bad:
+    SetColor lightRed
+    PrintMsg txtBad1
+    mov     eax, minVal
+    call    WriteDec
+    PrintMsg txtBad2
+    mov     eax, maxVal
+    call    WriteDec
+    PrintMsg txtBad3
+    SetColor white
+    jmp     RG_Retry
+ReadRange ENDP
+
+; ReadYesNo: read one key. Returns EAX = 1 for y/Y, otherwise 0.
+ReadYesNo PROC
+    call    ReadChar
+    push    eax
+    call    WriteChar                   ; echo the key
+    call    Crlf
+    pop     eax
+    or      al, 20h                     ; force lower case
+    cmp     al, 'y'
+    sete    al
+    movzx   eax, al
+    ret
+ReadYesNo ENDP
+
+; NumDigits: EAX = unsigned value -> ECX = number of decimal digits.
+NumDigits PROC USES eax ebx edx
+    mov     ecx, 1
+    mov     ebx, 10
+ND_Loop:
+    cmp     eax, 10
+    jb      ND_Done
+    xor     edx, edx
+    div     ebx
+    inc     ecx
+    jmp     ND_Loop
+ND_Done:
+    ret
+NumDigits ENDP
+
+; PrintSpaces: print ECX spaces (nothing if ECX <= 0).
+PrintSpaces PROC USES eax ecx
+PS_Loop:
+    cmp     ecx, 0
+    jle     PS_Done
+    mov     al, ' '
+    call    WriteChar
+    dec     ecx
+    jmp     PS_Loop
+PS_Done:
+    ret
+PrintSpaces ENDP
+
+; PrintNumPad: print EAX, then pad with spaces to width EBX.
+PrintNumPad PROC USES eax ebx ecx
+    call    NumDigits
+    call    WriteDec
+    sub     ebx, ecx
+    mov     ecx, ebx
+    call    PrintSpaces
+    ret
+PrintNumPad ENDP
+
+; StrLen: EDX = string -> ECX = length (REPNE SCASB).
+StrLen PROC USES edi eax
+    mov     edi, edx
+    xor     eax, eax
+    mov     ecx, -1
+    cld
+    repne   scasb
+    not     ecx
+    dec     ecx
+    ret
+StrLen ENDP
+
+; PrintStrPad: print string EDX, then pad with spaces to width EBX.
+PrintStrPad PROC USES eax ecx
+    call    WriteString
+    call    StrLen
+    neg     ecx
+    add     ecx, ebx
+    call    PrintSpaces
+    ret
+PrintStrPad ENDP
+
+; PrintFixed2: EAX = value x 100 -> prints "int.dd".
+PrintFixed2 PROC USES eax ebx edx
+    xor     edx, edx
+    mov     ebx, 100
+    div     ebx
+    call    WriteDec                    ; integer part
+    mov     al, '.'
+    call    WriteChar
+    mov     eax, edx                    ; fraction 0..99
+    cmp     eax, 10
+    jae     PF_Print
+    push    eax
+    mov     al, '0'                     ; leading zero for 0..9
+    call    WriteChar
+    pop     eax
+PF_Print:
+    call    WriteDec
+    ret
+PrintFixed2 ENDP
+
+; PrintFixed2Pad: like PrintFixed2, padded to width EBX.
+PrintFixed2Pad PROC USES eax ebx ecx edx
+    push    eax
+    push    ebx
+    xor     edx, edx
+    mov     ebx, 100
+    div     ebx                         ; EAX = integer part
+    pop     ebx
+    call    NumDigits
+    add     ecx, 3                      ; + ".dd"
+    pop     eax
+    call    PrintFixed2
+    neg     ecx
+    add     ecx, ebx
+    call    PrintSpaces
+    ret
+PrintFixed2Pad ENDP
+
+; PrintRepeat: print character AL, ECX times.
+PrintRepeat PROC USES ecx
+PR_Loop:
+    cmp     ecx, 0
+    jle     PR_Done
+    call    WriteChar
+    dec     ecx
+    jmp     PR_Loop
+PR_Done:
+    ret
+PrintRepeat ENDP
+
+; PrintBorder: ESI = array of column widths, ECX = column count.
+; Prints a line such as  +-------+-------+-------+
+PrintBorder PROC USES eax ecx esi
+    mov     al, '+'
+    call    WriteChar
+PB_Col:
+    cmp     ecx, 0
+    jle     PB_End
+    push    ecx
+    mov     ecx, [esi]
+    mov     al, '-'
+    call    PrintRepeat
+    mov     al, '+'
+    call    WriteChar
+    pop     ecx
+    add     esi, 4
+    dec     ecx
+    jmp     PB_Col
+PB_End:
+    call    Crlf
+    ret
+PrintBorder ENDP
+
+; SplitPad: EBX = width, ECX = content length ->
+;           ECX = left padding, EBX = right padding (never negative).
+SplitPad PROC USES eax
+    mov     eax, ebx
+    sub     eax, ecx
+    jge     SP_Ok
+    xor     eax, eax
+SP_Ok:
+    mov     ebx, eax
+    shr     eax, 1                      ; left = pad / 2
+    sub     ebx, eax                    ; right = pad - left
+    mov     ecx, eax
+    ret
+SplitPad ENDP
+
+; PrintCenterStr: EDX = string, EBX = cell width.
+; Prints the string centred in the cell followed by the '|' border.
+PrintCenterStr PROC USES eax ebx ecx edx
+    call    StrLen                      ; ECX = length
+    call    SplitPad
+    call    PrintSpaces
+    call    WriteString
+    mov     ecx, ebx
+    call    PrintSpaces
+    mov     al, '|'
+    call    WriteChar
+    ret
+PrintCenterStr ENDP
+
+; PrintCenterNum: EAX = unsigned number, EBX = cell width.
+PrintCenterNum PROC USES eax ebx ecx edx
+    push    eax
+    call    NumDigits                   ; ECX = digits
+    call    SplitPad
+    call    PrintSpaces
+    pop     eax
+    call    WriteDec
+    mov     ecx, ebx
+    call    PrintSpaces
+    mov     al, '|'
+    call    WriteChar
+    ret
+PrintCenterNum ENDP
+
+; PrintCenterPid: EAX = pid, EBX = cell width -> centred "P<pid>".
+PrintCenterPid PROC USES eax ebx ecx edx
+    push    eax
+    call    NumDigits
+    inc     ecx                         ; + the letter 'P'
+    call    SplitPad
+    call    PrintSpaces
+    pop     eax
+    call    PrintPid
+    mov     ecx, ebx
+    call    PrintSpaces
+    mov     al, '|'
+    call    WriteChar
+    ret
+PrintCenterPid ENDP
+
+; PrintCenterFixed: EAX = value x100, EBX = cell width -> centred "int.dd".
+PrintCenterFixed PROC USES eax ebx ecx edx
+    push    eax
+    push    ebx
+    xor     edx, edx
+    mov     ebx, 100
+    div     ebx                         ; EAX = integer part
+    call    NumDigits
+    add     ecx, 3                      ; + ".dd"
+    pop     ebx
+    call    SplitPad
+    call    PrintSpaces
+    pop     eax
+    call    PrintFixed2
+    mov     ecx, ebx
+    call    PrintSpaces
+    mov     al, '|'
+    call    WriteChar
+    ret
+PrintCenterFixed ENDP
+
+; PrintSegCell: EAX = pid or IDLE_PID, EBX = cell width.
+PrintSegCell PROC USES edx
+    cmp     eax, IDLE_PID
+    jne     PC_Proc
+    mov     edx, OFFSET sIdle
+    call    PrintCenterStr
+    ret
+PC_Proc:
+    call    PrintCenterPid
+    ret
+PrintSegCell ENDP
+
+; PrintPid: print "P<EAX>".
+PrintPid PROC USES eax
+    push    eax
+    mov     al, 'P'
+    call    WriteChar
+    pop     eax
+    call    WriteDec
+    ret
+PrintPid ENDP
+
+; PrintAlgName: EAX = algorithm id (1..4) -> print its full name.
+PrintAlgName PROC USES edx
+    mov     edx, algNames[eax*4 - 4]
+    call    WriteString
+    ret
+PrintAlgName ENDP
+
+; ShowStat: print label EDX, then number EAX and a newline.
+ShowStat PROC USES eax edx
+    call    WriteString
+    call    WriteDec
+    call    Crlf
+    ret
+ShowStat ENDP
+
+; Avg100: EAX = sum, EDI = count -> EAX = round(sum*100 / count).
+; Returns 0 when count = 0.
+Avg100 PROC USES ebx edx
+    cmp     edi, 0
+    je      AV_Zero
+    mov     ebx, 100
+    mul     ebx                         ; EDX:EAX = sum * 100
+    mov     ebx, edi
+    shr     ebx, 1                      ; + count/2 for rounding
+    add     eax, ebx
+    xor     edx, edx
+    div     edi
+    ret
+AV_Zero:
+    xor     eax, eax
+    ret
+Avg100 ENDP
+
+; =====================================================================
+;                           PROCESS MANAGEMENT
+; =====================================================================
+
+; ProcessManagement: submenu (add / update / delete / view / clear).
+ProcessManagement PROC USES eax
+PM_Loop:
+    ShowMenu txtPMTitle, txtPMMenu
+    INVOKE  ReadRange, ADDR prChoice, 1, 6
+    cmp     eax, 6
+    je      PM_Exit
+    dec     eax
+    call    DWORD PTR pmTable[eax*4]
+    call    Crlf
+    call    WaitMsg
+    jmp     PM_Loop
+PM_Exit:
+    ret
+ProcessManagement ENDP
+
+; FindPid: EAX = pid -> ESI = index of that process, or -1.
+FindPid PROC USES ecx
+    mov     esi, -1
+    xor     ecx, ecx
+FP_Loop:
+    cmp     ecx, procCount
+    jge     FP_Done
+    cmp     pidArr[ecx*4], eax
+    je      FP_Found
+    inc     ecx
+    jmp     FP_Loop
+FP_Found:
+    mov     esi, ecx
+FP_Done:
+    ret
+FindPid ENDP
+
+; ReadUniquePid: EDX = prompt, EDI = index allowed to keep its own ID
+; (-1 = none). Repeats until the ID is unused. Returns EAX = pid.
+ReadUniquePid PROC USES esi
+RU_Retry:
+    INVOKE  ReadRange, edx, 1, MAX_PID
+    call    FindPid
+    cmp     esi, -1
+    je      RU_Ok
+    cmp     esi, edi
+    je      RU_Ok
+    PrintColored txtDup, lightRed
+    jmp     RU_Retry
+RU_Ok:
+    ret
+ReadUniquePid ENDP
+
+; ReadProcFields: read arrival, burst and priority for process editIdx.
+ReadProcFields PROC USES eax ebx
+    INVOKE  ReadRange, ADDR prAt, 0, MAX_ARRIVAL
+    mov     ebx, editIdx
+    mov     atArr[ebx*4], eax
+    INVOKE  ReadRange, ADDR prBt, 1, MAX_BURST
+    mov     ebx, editIdx
+    mov     btArr[ebx*4], eax
+    INVOKE  ReadRange, ADDR prPri, 1, MAX_PRIORITY
+    mov     ebx, editIdx
+    mov     priArr[ebx*4], eax
+    ret
+ReadProcFields ENDP
+
+; AddProcess: append a new process (unique ID, validated fields).
+AddProcess PROC USES eax ebx edx edi
+    cmp     procCount, MAX_PROCESSES
+    jl      AP_Room
+    PrintColored txtFull, lightRed
+    ret
+AP_Room:
+    mov     edx, OFFSET prPid
+    mov     edi, -1
+    call    ReadUniquePid
+    mov     ebx, procCount
+    mov     pidArr[ebx*4], eax
+    mov     editIdx, ebx
+    call    ReadProcFields
+    inc     procCount
+    PrintColored txtAdded, lightGreen
+    ret
+AddProcess ENDP
+
+; UpdateProcess: replace all fields of an existing process.
+UpdateProcess PROC USES eax edx esi edi
+    cmp     procCount, 0
+    jne     UP_Have
+    PrintMsg txtNoProc
+    ret
+UP_Have:
+    INVOKE  ReadRange, ADDR prPidSel, 1, MAX_PID
+    call    FindPid
+    cmp     esi, -1
+    jne     UP_Found
+    PrintColored txtNotFound, lightRed
+    ret
+UP_Found:
+    mov     editIdx, esi
+    mov     edi, esi                    ; it may keep its own ID
+    mov     edx, OFFSET prNewPid
+    call    ReadUniquePid
+    mov     pidArr[esi*4], eax          ; ESI preserved by ReadUniquePid
+    call    ReadProcFields
+    PrintColored txtUpdated, lightGreen
+    ret
+UpdateProcess ENDP
+
+; DeleteProcess: remove a process and close the gap (REP MOVSD).
+DeleteProcess PROC USES eax ebx ecx edx esi edi
+    cmp     procCount, 0
+    jne     DL_Have
+    PrintMsg txtNoProc
+    ret
+DL_Have:
+    INVOKE  ReadRange, ADDR prPidSel, 1, MAX_PID
+    call    FindPid
+    cmp     esi, -1
+    jne     DL_Found
+    PrintColored txtNotFound, lightRed
+    ret
+DL_Found:
+    mov     ebx, esi                    ; EBX = deleted index
+    mov     edx, procCount
+    sub     edx, ebx
+    dec     edx                         ; EDX = elements after it
+    cld
+    ShiftLeft pidArr
+    ShiftLeft atArr
+    ShiftLeft btArr
+    ShiftLeft priArr
+    dec     procCount
+    PrintColored txtDeleted, lightGreen
+    ret
+DeleteProcess ENDP
+
+; ClearProcesses: after confirmation, zero all four arrays (REP STOSD).
+ClearProcesses PROC USES eax ecx edi
+    cmp     procCount, 0
+    jne     CL_Have
+    PrintMsg txtNoProc
+    ret
+CL_Have:
+    PrintMsg txtConfirm
+    call    ReadYesNo
+    test    eax, eax
+    jnz     CL_Do
+    PrintMsg txtCancelled
+    ret
+CL_Do:
+    cld
+    xor     eax, eax
+    mov     ecx, MAX_PROCESSES * 4      ; the 4 arrays are contiguous
+    mov     edi, OFFSET pidArr
+    rep     stosd
+    mov     procCount, 0
+    PrintColored txtCleared, lightGreen
+    ret
+ClearProcesses ENDP
+
+; DisplayProcesses: print the process table.
+DisplayProcesses PROC USES eax ebx ecx edx
+    cmp     procCount, 0
+    jne     DP_Have
+    PrintMsg txtNoProc
+    ret
+DP_Have:
+    Border  wProc, 4
+    SetColor yellow
+    Bar
+    CellStr hPID, TBL_W
+    CellStr hAT,  TBL_W
+    CellStr hBT,  TBL_W
+    CellStr hPRI, TBL_W
+    call    Crlf
+    SetColor white
+    Border  wProc, 4
+    xor     ecx, ecx
+DP_Loop:
+    cmp     ecx, procCount
+    jge     DP_Done
+    Bar
+    CellNum pidArr[ecx*4], TBL_W
+    CellNum atArr[ecx*4],  TBL_W
+    CellNum btArr[ecx*4],  TBL_W
+    CellNum priArr[ecx*4], TBL_W
+    call    Crlf
+    inc     ecx
+    jmp     DP_Loop
+DP_Done:
+    Border  wProc, 4
+    ret
+DisplayProcesses ENDP
+
+; =====================================================================
+;                           WORKLOAD GENERATOR
+; =====================================================================
+
+; GenerateWorkload: options 1-3 load a template; 4-6 call other screens.
+GenerateWorkload PROC USES eax ecx esi
+WL_Loop:
+    ShowMenu txtWLTitle, txtWLMenu
+    INVOKE  ReadRange, ADDR prChoice, 1, 7
+    cmp     eax, 7
+    je      WL_Exit
+    cmp     eax, 3
+    jbe     WL_Generate
+    sub     eax, 4                      ; options 4..6 -> table index
+    call    DWORD PTR wlActions[eax*4]
+    jmp     WL_Loop
+WL_Generate:
+    push    eax                         ; keep scenario number
+    cmp     procCount, 0
+    je      WL_Load
+    PrintMsg txtOverwrite
+    call    ReadYesNo
+    test    eax, eax
+    jnz     WL_Load
+    pop     eax                         ; user said no
+    jmp     WL_Loop
+WL_Load:
+    pop     eax
+    mov     esi, wlAddr[eax*4 - 4]      ; template address
+    mov     ecx, wlCount[eax*4 - 4]     ; number of processes
+    call    LoadTemplate
+    call    Crlf
+    call    DisplayProcesses
+    PrintColored txtGenerated, lightGreen
+    call    Crlf
+    call    WaitMsg
+    jmp     WL_Loop
+WL_Exit:
+    ret
+GenerateWorkload ENDP
+
+; LoadTemplate: ESI = template, ECX = process count.
+; Splits each 4-DWORD record (LODSD) into the parallel arrays.
+LoadTemplate PROC USES eax ebx ecx esi
+    cld
+    xor     ebx, ebx
+LT_Loop:
+    cmp     ebx, ecx
+    jge     LT_Done
+    lodsd
+    mov     pidArr[ebx*4], eax
+    lodsd
+    mov     atArr[ebx*4], eax
+    lodsd
+    mov     btArr[ebx*4], eax
+    lodsd
+    mov     priArr[ebx*4], eax
+    inc     ebx
+    jmp     LT_Loop
+LT_Done:
+    mov     procCount, ecx
+    ret
+LoadTemplate ENDP
+
+; =====================================================================
+;                    INDIVIDUAL SIMULATION / COMPARISON
+; =====================================================================
+
+; SelectAlgorithm: show algorithm menu, return EAX = 1..5 (5 = cancel).
+SelectAlgorithm PROC, pPrompt:PTR BYTE
+    PrintMsg algMenu
+    INVOKE  ReadRange, pPrompt, 1, 5
+    ret
+SelectAlgorithm ENDP
+
+; ReadQuantum: ask the Round Robin time quantum into rrQuantum.
+ReadQuantum PROC USES eax
+    INVOKE  ReadRange, ADDR prQuantum, 1, MAX_QUANTUM
+    mov     rrQuantum, eax
+    ret
+ReadQuantum ENDP
+
+; RunAlgorithm: EAX = algorithm id; runs it through algTable.
+RunAlgorithm PROC USES eax
+    mov     curAlg, eax
+    dec     eax
+    call    DWORD PTR algTable[eax*4]
+    ret
+RunAlgorithm ENDP
+
+; IndividualSimulation: run one algorithm, store and display the result.
+IndividualSimulation PROC USES eax esi
+    call    Clrscr
+    PrintColored txtIndTitle, yellow
+    cmp     procCount, 0
+    jne     IS_Have
+    PrintColored txtNoData, lightRed
+    jmp     IS_Pause
+IS_Have:
+    INVOKE  SelectAlgorithm, ADDR prAlgPick
+    cmp     eax, 5
+    je      IS_Exit
+    cmp     eax, ALG_RR
+    jne     IS_Run
+    call    ReadQuantum                 ; EAX (algorithm id) is preserved
+IS_Run:
+    call    RunAlgorithm
+    call    AllocHistorySlot            ; EAX = history slot
+    mov     esi, eax
+    call    SaveResult
+    call    DisplayResult               ; EAX still = slot
+    call    Crlf
+    PrintMsg txtSaved
+    mov     eax, slotSerial[esi*4]
+    call    WriteDec
+    call    Crlf
+IS_Pause:
+    call    Crlf
+    call    WaitMsg
+IS_Exit:
+    ret
+IndividualSimulation ENDP
+
+; CompareAlgorithms: run two different algorithms on the same data and
+; show both results plus a comparison table.
+CompareAlgorithms PROC USES eax
+    call    Clrscr
+    PrintColored txtCmpTitle, yellow
+    cmp     procCount, 0
+    jne     CA_Have
+    PrintColored txtNoData, lightRed
+    jmp     CA_Pause
+CA_Have:
+    INVOKE  SelectAlgorithm, ADDR prFirst
+    cmp     eax, 5
+    je      CA_Exit
+    mov     algA, eax
+CA_Second:
+    INVOKE  SelectAlgorithm, ADDR prSecond
+    cmp     eax, 5
+    je      CA_Exit
+    cmp     eax, algA
+    jne     CA_Diff
+    PrintColored txtSame, lightRed
+    jmp     CA_Second
+CA_Diff:
+    mov     algB, eax
+    cmp     algA, ALG_RR                ; quantum needed only if RR is chosen
+    je      CA_AskQ
+    cmp     algB, ALG_RR
+    jne     CA_Run
+CA_AskQ:
+    call    ReadQuantum
+CA_Run:
+    mov     eax, algA
+    call    RunAlgorithm
+    mov     eax, CMP_SLOT_A
+    call    SaveResult
+    mov     eax, algB
+    call    RunAlgorithm
+    mov     eax, CMP_SLOT_B
+    call    SaveResult
+    mov     cmpValid, 1
+    call    ShowComparison
+CA_Pause:
+    call    Crlf
+    call    WaitMsg
+CA_Exit:
+    ret
+CompareAlgorithms ENDP
+
+; ShowComparison: display both stored results and the comparison table.
+ShowComparison PROC USES eax
+    PrintColored txtFirstAlg, lightGreen
+    mov     eax, CMP_SLOT_A
+    call    DisplayResult
+    PrintColored txtSecondAlg, lightGreen
+    mov     eax, CMP_SLOT_B
+    call    DisplayResult
+    call    ShowComparisonTable
+    ret
+ShowComparison ENDP
+
+; ShowComparisonTable: averages of A and B side by side, better one marked.
+ShowComparisonTable PROC USES eax ebx edx
+    mov     eax, CMP_SLOT_A             ; keep A's averages in cmp* variables
+    call    ComputeAverages
+    mov     eax, avgWT
+    mov     cmpAWT, eax
+    mov     eax, avgTAT
+    mov     cmpATAT, eax
+    mov     eax, avgRT
+    mov     cmpART, eax
+    mov     eax, CMP_SLOT_B             ; B's averages stay in avg*
+    call    ComputeAverages
+    PrintColored txtCmpHdr, yellow
+    Border  wCmp, 4
+    SetColor yellow
+    Bar
+    CellStr hMetric, 16
+    mov     eax, slotAlg[CMP_SLOT_A*4]
+    mov     edx, shortNames[eax*4 - 4]
+    mov     ebx, 12
+    call    PrintCenterStr
+    mov     eax, slotAlg[CMP_SLOT_B*4]
+    mov     edx, shortNames[eax*4 - 4]
+    mov     ebx, 12
+    call    PrintCenterStr
+    CellStr hBetter, 10
+    call    Crlf
+    SetColor white
+    Border  wCmp, 4
+    mov     edx, OFFSET lblAvgWT
+    mov     eax, cmpAWT
+    mov     ebx, avgWT
+    call    CompareRow
+    mov     edx, OFFSET lblAvgTAT
+    mov     eax, cmpATAT
+    mov     ebx, avgTAT
+    call    CompareRow
+    mov     edx, OFFSET lblAvgRT
+    mov     eax, cmpART
+    mov     ebx, avgRT
+    call    CompareRow
+    Border  wCmp, 4
+    PrintMsg txtLowerHdr
+    PrintMsg txtNote
+    ret
+ShowComparisonTable ENDP
+
+CompareRow PROC USES eax ebx edx
+    mov     rowA, eax
+    mov     rowB, ebx
+    Bar
+    mov     ebx, 16
+    call    PrintCenterStr              ; label in EDX
+    mov     eax, rowA
+    mov     ebx, 12
+    call    PrintCenterFixed
+    mov     eax, rowB
+    mov     ebx, 12
+    call    PrintCenterFixed
+    mov     eax, rowA
+    cmp     eax, rowB
+    jl      CR_A
+    jg      CR_B
+    mov     edx, OFFSET txtTie
+    jmp     CR_Print
+CR_A:
+    mov     eax, slotAlg[CMP_SLOT_A*4]
+    jmp     CR_Name
+CR_B:
+    mov     eax, slotAlg[CMP_SLOT_B*4]
+CR_Name:
+    mov     edx, shortNames[eax*4 - 4]
+CR_Print:
+    mov     ebx, 10
+    call    PrintCenterStr
+    call    Crlf
+    ret
+CompareRow ENDP
+
+; =====================================================================
+;                          SCHEDULING ENGINE
+; =====================================================================
+
+; InitWorking: build a fresh working copy from the original data.
+InitWorking PROC USES eax ecx esi edi
+    cld
+    mov     esi, OFFSET btArr           ; remaining = burst
+    mov     edi, OFFSET remArr
+    mov     ecx, procCount
+    rep     movsd
+    FillArr startArr, NOT_STARTED
+    FillArr ctArr, 0
+    FillArr doneArr, 0
+    FillArr admitArr, 0
+    mov     gCount, 0
+    mov     segOverflow, 0
+    mov     clockT, 0
+    mov     rqHead, 0
+    mov     rqTail, 0
+    mov     rqCount, 0
+    ret
+InitWorking ENDP
+
+; AddSegment: EAX = pid (or IDLE_PID), EBX = start, EDX = end.
+; Extends the previous segment if same process and contiguous;
+; ignores empty segments; flags overflow when the array is full.
+AddSegment PROC USES eax ebx ecx edx esi
+    cmp     edx, ebx
+    jle     AS_Done
+    mov     esi, gCount
+    cmp     esi, 0
+    je      AS_New
+    cmp     gPid[esi*4 - 4], eax
+    jne     AS_New
+    cmp     gEnd[esi*4 - 4], ebx
+    jne     AS_New
+    mov     gEnd[esi*4 - 4], edx        ; merge with previous segment
+    jmp     AS_Done
+AS_New:
+    cmp     esi, MAX_SEGMENTS
+    jl      AS_Store
+    mov     segOverflow, 1
+    jmp     AS_Done
+AS_Store:
+    mov     gPid[esi*4], eax
+    mov     gStart[esi*4], ebx
+    mov     gEnd[esi*4], edx
+    inc     gCount
+AS_Done:
+    ret
+AddSegment ENDP
+
+; SelectEarliest: EDI = flag array (doneArr / admitArr).
+; Returns ESI = unflagged process with the earliest arrival
+; (lowest index on ties), or -1.
+SelectEarliest PROC USES eax ecx edx
+    mov     esi, -1
+    mov     edx, 7FFFFFFFh
+    xor     ecx, ecx
+SE_Loop:
+    cmp     ecx, procCount
+    jge     SE_Done
+    cmp     DWORD PTR [edi+ecx*4], 0
+    jne     SE_Next
+    mov     eax, atArr[ecx*4]
+    cmp     eax, edx
+    jge     SE_Next
+    mov     edx, eax
+    mov     esi, ecx
+SE_Next:
+    inc     ecx
+    jmp     SE_Loop
+SE_Done:
+    ret
+SelectEarliest ENDP
+
+; SelectMinReady: EAX = clock, EDI = key array, ECX = preferred index
+; (-1 = none). Among arrived, unfinished processes picks the smallest
+; key (lowest index on ties; the preferred process wins equal keys).
+; Returns ESI = chosen index or -1.
+SelectMinReady PROC USES eax ebx edx
+    mov     esi, -1
+    mov     edx, 7FFFFFFFh              ; best key so far
+    xor     ebx, ebx
+SM_Loop:
+    cmp     ebx, procCount
+    jge     SM_Pref
+    cmp     doneArr[ebx*4], 0
+    jne     SM_Next
+    cmp     atArr[ebx*4], eax
+    jg      SM_Next
+    cmp     edx, [edi+ebx*4]
+    jle     SM_Next
+    mov     edx, [edi+ebx*4]
+    mov     esi, ebx
+SM_Next:
+    inc     ebx
+    jmp     SM_Loop
+SM_Pref:                                ; tie-break in favour of ECX
+    cmp     ecx, 0
+    jl      SM_Done
+    cmp     esi, -1
+    je      SM_Done
+    cmp     doneArr[ecx*4], 0
+    jne     SM_Done
+    cmp     atArr[ecx*4], eax
+    jg      SM_Done
+    cmp     edx, [edi+ecx*4]
+    jne     SM_Done
+    mov     esi, ecx
+SM_Done:
+    ret
+SelectMinReady ENDP
+
+; IdleToNext: EDI = flag array. Records an IDLE segment from the clock
+; to the earliest unflagged arrival and advances the clock there.
+; Returns ESI = that process, or -1 if none is left.
+IdleToNext PROC USES eax ebx edx
+    call    SelectEarliest
+    cmp     esi, -1
+    je      IN_Done
+    mov     eax, IDLE_PID
+    mov     ebx, clockT
+    mov     edx, atArr[esi*4]
+    call    AddSegment
+    mov     clockT, edx
+IN_Done:
+    ret
+IdleToNext ENDP
+
+; ---------------------------------------------------------------------
+; FCFS (non-preemptive): run in arrival order to completion
+; ---------------------------------------------------------------------
+RunFCFS PROC USES eax ebx ecx edx esi edi
+    call    InitWorking
+    mov     edi, OFFSET doneArr
+    mov     ecx, procCount              ; processes still to schedule
+FC_Loop:
+    cmp     ecx, 0
+    jle     FC_Done
+    call    SelectEarliest              ; next process in arrival order
+    mov     eax, atArr[esi*4]
+    cmp     clockT, eax
+    jge     FC_Run
+    mov     ebx, clockT                 ; not arrived yet -> CPU idle
+    mov     edx, eax
+    mov     eax, IDLE_PID
+    call    AddSegment
+    mov     eax, atArr[esi*4]
+    mov     clockT, eax
+FC_Run:
+    mov     eax, clockT
+    mov     startArr[esi*4], eax
+    mov     ebx, eax
+    mov     edx, eax
+    add     edx, btArr[esi*4]           ; runs until finished
+    mov     eax, pidArr[esi*4]
+    call    AddSegment
+    mov     clockT, edx
+    mov     ctArr[esi*4], edx
+    mov     doneArr[esi*4], 1
+    dec     ecx
+    jmp     FC_Loop
+FC_Done:
+    ret
+RunFCFS ENDP
+
+; ---------------------------------------------------------------------
+; Round Robin: circular ready queue (Enqueue / Dequeue)
+; ---------------------------------------------------------------------
+
+; Enqueue: ESI = process index -> add at the tail of the queue.
+Enqueue PROC USES ebx
+    mov     ebx, rqTail
+    mov     rq[ebx*4], esi
+    inc     ebx
+    cmp     ebx, MAX_PROCESSES
+    jl      EQ_Store
+    xor     ebx, ebx                    ; wrap around
+EQ_Store:
+    mov     rqTail, ebx
+    inc     rqCount
+    ret
+Enqueue ENDP
+
+; Dequeue: remove the head of the queue -> ESI = process index.
+Dequeue PROC USES ebx
+    mov     ebx, rqHead
+    mov     esi, rq[ebx*4]
+    inc     ebx
+    cmp     ebx, MAX_PROCESSES
+    jl      DQ_Store
+    xor     ebx, ebx                    ; wrap around
+DQ_Store:
+    mov     rqHead, ebx
+    dec     rqCount
+    ret
+Dequeue ENDP
+
+; AdmitArrivals: EAX = clock. Queue every not-yet-queued process with
+; arrival <= clock, in arrival order.
+AdmitArrivals PROC USES eax ebx edx esi edi
+    mov     edx, eax
+AA_Loop:
+    mov     edi, OFFSET admitArr
+    call    SelectEarliest
+    cmp     esi, -1
+    je      AA_Done
+    cmp     atArr[esi*4], edx
+    jg      AA_Done
+    mov     admitArr[esi*4], 1
+    call    Enqueue
+    jmp     AA_Loop
+AA_Done:
+    ret
+AdmitArrivals ENDP
+
+RunRoundRobin PROC USES eax ebx ecx edx esi edi
+    call    InitWorking
+    mov     finishedCnt, 0
+RB_Loop:
+    mov     eax, finishedCnt
+    cmp     eax, procCount
+    jge     RB_Done
+    mov     eax, clockT
+    call    AdmitArrivals
+    cmp     rqCount, 0
+    jne     RB_Dispatch
+    mov     edi, OFFSET admitArr        ; queue empty -> idle until next arrival
+    call    IdleToNext
+    cmp     esi, -1
+    je      RB_Done
+    jmp     RB_Loop
+RB_Dispatch:
+    call    Dequeue                     ; ESI = front process
+    cmp     startArr[esi*4], NOT_STARTED
+    jne     RB_Slice
+    mov     eax, clockT
+    mov     startArr[esi*4], eax        ; first CPU allocation
+RB_Slice:
+    mov     ecx, remArr[esi*4]          ; slice = min(remaining, quantum)
+    cmp     ecx, rrQuantum
+    jle     RB_Exec
+    mov     ecx, rrQuantum
+RB_Exec:
+    mov     eax, pidArr[esi*4]
+    mov     ebx, clockT
+    mov     edx, ebx
+    add     edx, ecx
+    call    AddSegment
+    mov     clockT, edx
+    sub     remArr[esi*4], ecx
+    mov     eax, clockT
+    call    AdmitArrivals               ; arrivals queue BEFORE the requeue
+    cmp     remArr[esi*4], 0
+    jg      RB_Requeue
+    mov     eax, clockT                 ; finished
+    mov     ctArr[esi*4], eax
+    mov     doneArr[esi*4], 1
+    inc     finishedCnt
+    jmp     RB_Loop
+RB_Requeue:
+    call    Enqueue                     ; unfinished -> back of the queue
+    jmp     RB_Loop
+RB_Done:
+    ret
+RunRoundRobin ENDP
+
+; ---------------------------------------------------------------------
+; Shared engine for Priority and SRTF: every time unit, re-select the
+; ready process with the smallest key (so better arrivals preempt).
+;   EDI = key array (priArr or remArr)
+;   EBX = 1 -> running process wins equal keys
+; ---------------------------------------------------------------------
+RunTimeStepped PROC USES eax ebx ecx edx esi edi
+    mov     preferFlag, ebx
+    mov     metricBase, edi
+    call    InitWorking
+    mov     finishedCnt, 0
+    mov     lastIdx, -1
+TS_Loop:
+    mov     eax, finishedCnt
+    cmp     eax, procCount
+    jge     TS_Done
+    mov     eax, clockT
+    mov     edi, metricBase
+    mov     ecx, -1                     ; no preferred process by default
+    cmp     preferFlag, 0
+    je      TS_Select
+    mov     ecx, lastIdx
+TS_Select:
+    call    SelectMinReady              ; ESI = process to run, or -1
+    cmp     esi, -1
+    jne     TS_Run
+    mov     edi, OFFSET doneArr         ; nobody ready -> CPU idle
+    call    IdleToNext
+    cmp     esi, -1
+    je      TS_Done
+    mov     lastIdx, -1
+    jmp     TS_Loop
+TS_Run:
+    cmp     startArr[esi*4], NOT_STARTED
+    jne     TS_Exec
+    mov     eax, clockT
+    mov     startArr[esi*4], eax        ; record first start once
+TS_Exec:
+    mov     eax, pidArr[esi*4]          ; run exactly 1 time unit
+    mov     ebx, clockT
+    mov     edx, ebx
+    inc     edx
+    call    AddSegment
+    mov     clockT, edx
+    mov     lastIdx, esi
+    dec     remArr[esi*4]
+    jnz     TS_Loop                     ; not finished yet
+    mov     eax, clockT
+    mov     ctArr[esi*4], eax           ; finished at end of this unit
+    mov     doneArr[esi*4], 1
+    inc     finishedCnt
+    mov     lastIdx, -1
+    jmp     TS_Loop
+TS_Done:
+    ret
+RunTimeStepped ENDP
+
+; RunPriority: key = priority; equal priorities -> lowest input order.
+RunPriority PROC USES ebx edi
+    mov     edi, OFFSET priArr
+    xor     ebx, ebx
+    call    RunTimeStepped
+    ret
+RunPriority ENDP
+
+; RunSRTF: key = remaining time; ties -> keep the running process.
+RunSRTF PROC USES ebx edi
+    mov     edi, OFFSET remArr
+    mov     ebx, 1
+    call    RunTimeStepped
+    ret
+RunSRTF ENDP
+
+; =====================================================================
+;                    SESSION HISTORY / SAVED RESULTS
+; =====================================================================
+
+; AllocHistorySlot: returns EAX = slot for the next individual run.
+; Ring buffer (slot = serial mod MAX_HISTORY); warns when it replaces
+; the oldest run.
+AllocHistorySlot PROC USES ebx ecx edx
+    mov     eax, histSerial
+    xor     edx, edx
+    mov     ecx, MAX_HISTORY
+    div     ecx
+    mov     ebx, edx                    ; EBX = slot
+    cmp     histSerial, MAX_HISTORY
+    jb      AH_Fresh
+    SetColor lightRed
+    PrintMsg txtReplace
+    mov     eax, slotSerial[ebx*4]
+    call    WriteDec
+    call    Crlf
+    SetColor white
+AH_Fresh:
+    inc     histSerial
+    mov     eax, histSerial
+    mov     slotSerial[ebx*4], eax      ; run number shown to the user
+    mov     lastSlot, ebx
+    mov     eax, ebx
+    ret
+AllocHistorySlot ENDP
+
+; SaveResult: EAX = slot. Copies settings, input, results and Gantt of
+; the finished run into the slot (REP MOVSD per array).
+SaveResult PROC USES eax ebx ecx edx esi edi
+    mov     ebx, eax                    ; EBX = slot
+    mov     edx, eax
+    imul    edx, MAX_PROCESSES * 4      ; EDX = byte offset of process row
+    imul    eax, MAX_SEGMENTS * 4       ; EAX = byte offset of segment row
+    mov     ecx, curAlg
+    mov     slotAlg[ebx*4], ecx
+    xor     ecx, ecx                    ; quantum only matters for RR
+    cmp     curAlg, ALG_RR
+    jne     SR_Q
+    mov     ecx, rrQuantum
+SR_Q:
+    mov     slotQuantum[ebx*4], ecx
+    mov     ecx, procCount
+    mov     slotN[ebx*4], ecx
+    mov     ecx, gCount
+    mov     slotSegCnt[ebx*4], ecx
+    mov     ecx, segOverflow
+    mov     slotOvf[ebx*4], ecx
+    cld
+    CopyDwords pidArr,   slotPid,    edx, procCount
+    CopyDwords atArr,    slotAt,     edx, procCount
+    CopyDwords btArr,    slotBt,     edx, procCount
+    CopyDwords priArr,   slotPri,    edx, procCount
+    CopyDwords ctArr,    slotCt,     edx, procCount
+    CopyDwords startArr, slotStart,  edx, procCount
+    CopyDwords gPid,     slotGPid,   eax, gCount
+    CopyDwords gStart,   slotGStart, eax, gCount
+    CopyDwords gEnd,     slotGEnd,   eax, gCount
+    ret
+SaveResult ENDP
+
+; =====================================================================
+;                    RESULT DISPLAY (reads slots only)
+; =====================================================================
+
+; DisplayResult: EAX = slot. Header, Gantt chart, metrics, averages.
+DisplayResult PROC USES eax esi
+    mov     esi, eax
+    call    Crlf
+    SetColor lightCyan
+    PrintMsg txtAlgLabel
+    mov     eax, slotAlg[esi*4]
+    call    PrintAlgName
+    cmp     slotAlg[esi*4], ALG_RR
+    jne     DR_NoQ
+    PrintMsg txtQuantum                 ; show quantum for RR
+    mov     eax, slotQuantum[esi*4]
+    call    WriteDec
+    PrintMsg txtCloseP
+DR_NoQ:
+    call    Crlf
+    SetColor white
+    PrintMsg txtGanttHdr
+    mov     eax, esi
+    call    GenerateGanttChart
+    cmp     slotOvf[esi*4], 0
+    je      DR_Metrics
+    PrintColored txtOvf, lightRed
+DR_Metrics:
+    mov     eax, esi
+    call    DisplayMetrics
+    ret
+DisplayResult ENDP
+
+; GenerateGanttChart: EAX = slot. Prints up to GANTT_PER_LINE cells per
+; row: a label line (| P1 | P2 |) and a line of boundary times.
+GenerateGanttChart PROC USES eax ebx ecx edx esi edi
+    mov     esi, eax
+    mov     ebx, esi
+    imul    ebx, MAX_SEGMENTS           ; EBX = first segment of the slot
+    mov     edi, slotSegCnt[esi*4]      ; EDI = number of segments
+    xor     ecx, ecx                    ; ECX = first segment of this row
+GG_Row:
+    cmp     ecx, edi
+    jge     GG_End
+    mov     eax, ecx
+    add     eax, GANTT_PER_LINE
+    cmp     eax, edi
+    jle     GG_SetEnd
+    mov     eax, edi
+GG_SetEnd:
+    mov     chunkEnd, eax               ; row covers [ECX, chunkEnd)
+    mov     chunkStart, ecx
+    call    GanttBorder                 ; +------+------+
+    Bar                                 ; |  P1  | IDLE |
+    mov     edx, ecx
+GG_L1:
+    cmp     edx, chunkEnd
+    jge     GG_L1End
+    lea     eax, [ebx+edx]
+    mov     eax, slotGPid[eax*4]
+    push    ebx
+    mov     ebx, GANTT_W
+    call    PrintSegCell
+    pop     ebx
+    inc     edx
+    jmp     GG_L1
+GG_L1End:
+    call    Crlf
+    call    GanttBorder
+    mov     edx, ecx
+GG_L2:                                  ; times sit under each '+'
+    cmp     edx, chunkEnd
+    jge     GG_L2End
+    lea     eax, [ebx+edx]
+    mov     eax, slotGStart[eax*4]
+    push    ebx
+    mov     ebx, GANTT_W + 1
+    call    PrintNumPad
+    pop     ebx
+    inc     edx
+    jmp     GG_L2
+GG_L2End:
+    mov     eax, chunkEnd               ; end time of the last cell
+    dec     eax
+    add     eax, ebx
+    mov     eax, slotGEnd[eax*4]
+    call    WriteDec
+    call    Crlf
+    call    Crlf
+    mov     ecx, chunkEnd
+    jmp     GG_Row
+GG_End:
+    ret
+GenerateGanttChart ENDP
+
+; GanttBorder: border line for the cells chunkStart .. chunkEnd-1.
+GanttBorder PROC USES ecx esi
+    mov     ecx, chunkEnd
+    sub     ecx, chunkStart
+    mov     esi, OFFSET wGantt
+    call    PrintBorder
+    ret
+GanttBorder ENDP
+
+; CalculateMetrics: EAX = slot, ECX = process index.
+; Sets mPid mAT mBT mPri mCT mTAT mWT mRT where
+;   TAT = CT - AT,  WT = TAT - BT,  RT = first start - AT
+CalculateMetrics PROC USES eax edx
+    mov     edx, eax
+    imul    edx, MAX_PROCESSES
+    add     edx, ecx                    ; flat index (slot,i)
+    mov     eax, slotPid[edx*4]
+    mov     mPid, eax
+    mov     eax, slotPri[edx*4]
+    mov     mPri, eax
+    mov     eax, slotAt[edx*4]
+    mov     mAT, eax
+    mov     eax, slotBt[edx*4]
+    mov     mBT, eax
+    mov     eax, slotCt[edx*4]
+    mov     mCT, eax
+    sub     eax, mAT
+    mov     mTAT, eax
+    sub     eax, mBT
+    mov     mWT, eax
+    mov     eax, slotStart[edx*4]
+    sub     eax, mAT
+    mov     mRT, eax
+    ret
+CalculateMetrics ENDP
+
+; ComputeAverages: EAX = slot -> avgWT, avgTAT, avgRT (values x100).
+ComputeAverages PROC USES eax ecx edx esi edi
+    mov     esi, eax
+    mov     sumWT, 0
+    mov     sumTAT, 0
+    mov     sumRT, 0
+    mov     edi, slotN[esi*4]           ; EDI = n (Avg100 guards n = 0)
+    xor     ecx, ecx
+CV_Loop:
+    cmp     ecx, edi
+    jge     CV_Calc
+    mov     eax, esi
+    call    CalculateMetrics
+    mov     eax, mWT
+    add     sumWT, eax
+    mov     eax, mTAT
+    add     sumTAT, eax
+    mov     eax, mRT
+    add     sumRT, eax
+    inc     ecx
+    jmp     CV_Loop
+CV_Calc:
+    mov     eax, sumWT
+    call    Avg100
+    mov     avgWT, eax
+    mov     eax, sumTAT
+    call    Avg100
+    mov     avgTAT, eax
+    mov     eax, sumRT
+    call    Avg100
+    mov     avgRT, eax
+    ret
+ComputeAverages ENDP
+
+; DisplayMetrics: EAX = slot. Per-process table plus the 3 averages.
+DisplayMetrics PROC USES eax ebx ecx edx esi edi
+    mov     esi, eax
+    PrintColored hdrMetrics, yellow
+    Border  wMetrics, 8
+    SetColor yellow
+    Bar
+    CellStr hPID, TBL_W
+    CellStr hAT,  TBL_W
+    CellStr hBT,  TBL_W
+    CellStr hPRI, TBL_W
+    CellStr hCT,  TBL_W
+    CellStr hTAT, TBL_W
+    CellStr hWT,  TBL_W
+    CellStr hRT,  TBL_W
+    call    Crlf
+    SetColor white
+    Border  wMetrics, 8
+    mov     edi, slotN[esi*4]
+    xor     ecx, ecx
+DM_Row:
+    cmp     ecx, edi
+    jge     DM_End
+    mov     eax, esi
+    call    CalculateMetrics
+    Bar
+    CellNum mPid, TBL_W
+    CellNum mAT,  TBL_W
+    CellNum mBT,  TBL_W
+    CellNum mPri, TBL_W
+    CellNum mCT,  TBL_W
+    CellNum mTAT, TBL_W
+    CellNum mWT,  TBL_W
+    CellNum mRT,  TBL_W
+    call    Crlf
+    inc     ecx
+    jmp     DM_Row
+DM_End:
+    Border  wMetrics, 8
+DM_Avg:
+    call    Crlf
+    mov     eax, esi
+    call    ComputeAverages
+    PrintMsg txtAvgWT
+    mov     eax, avgWT
+    call    PrintFixed2
+    call    Crlf
+    PrintMsg txtAvgTAT
+    mov     eax, avgTAT
+    call    PrintFixed2
+    call    Crlf
+    PrintMsg txtAvgRT
+    mov     eax, avgRT
+    call    PrintFixed2
+    call    Crlf
+    ret
+DisplayMetrics ENDP
+
+; =====================================================================
+;                          VIEW PREVIOUS RESULTS
+; =====================================================================
+
+; ViewPreviousResults: show the last run, an earlier run or the last comparison.
+ViewPreviousResults PROC USES eax esi
+VP_Loop:
+    ShowMenu txtPrevTitle, txtPrevMenu
+    INVOKE  ReadRange, ADDR prChoice, 1, 4
+    cmp     eax, 4
+    je      VP_Exit
+    cmp     eax, 1
+    je      VP_Last
+    cmp     eax, 2
+    je      VP_Earlier
+    cmp     cmpValid, 0                 ; option 3: last comparison
+    jne     VP_ShowCmp
+    PrintMsg txtNoCmp
+    jmp     VP_Wait
+VP_ShowCmp:
+    call    ShowComparison
+    jmp     VP_Wait
+VP_Last:
+    cmp     histSerial, 0
+    jne     VP_ShowLast
+    PrintMsg txtNoRuns
+    jmp     VP_Wait
+VP_ShowLast:
+    mov     eax, lastSlot
+    call    DisplayResult
+    jmp     VP_Wait
+VP_Earlier:
+    cmp     histSerial, 0
+    jne     VP_Pick
+    PrintMsg txtNoRuns
+    jmp     VP_Wait
+VP_Pick:
+    call    PickRun                     ; ESI = slot or -1
+    cmp     esi, -1
+    je      VP_Wait
+    mov     eax, esi
+    call    DisplayResult
+VP_Wait:
+    call    Crlf
+    call    WaitMsg
+    jmp     VP_Loop
+VP_Exit:
+    ret
+ViewPreviousResults ENDP
+
+; ListHistory: print every stored individual run.
+ListHistory PROC USES eax ecx
+    PrintColored hdrRuns, yellow
+    xor     ecx, ecx
+LH_Loop:
+    cmp     ecx, MAX_HISTORY
+    jge     LH_Done
+    mov     eax, slotSerial[ecx*4]
+    cmp     eax, 0                      ; 0 = empty slot
+    je      LH_Next
+    PrintMsg txtRunNo
+    call    WriteDec
+    PrintMsg txtColon
+    mov     eax, slotAlg[ecx*4]
+    call    PrintAlgName
+    PrintMsg txtProcsOf
+    mov     eax, slotN[ecx*4]
+    call    WriteDec
+    PrintMsg txtProcsEnd
+LH_Next:
+    inc     ecx
+    jmp     LH_Loop
+LH_Done:
+    call    Crlf
+    ret
+ListHistory ENDP
+
+; PickRun: list runs and ask for a run number.
+; Returns ESI = slot of that run, or -1 if it was replaced.
+PickRun PROC USES eax ecx
+    call    ListHistory
+    INVOKE  ReadRange, ADDR prRunNo, 1, histSerial
+    mov     esi, -1
+    xor     ecx, ecx
+PK_Loop:
+    cmp     ecx, MAX_HISTORY
+    jge     PK_Gone
+    cmp     slotSerial[ecx*4], eax
+    je      PK_Found
+    inc     ecx
+    jmp     PK_Loop
+PK_Found:
+    mov     esi, ecx
+    ret
+PK_Gone:
+    PrintColored txtRunGone, lightRed
+    ret
+PickRun ENDP
+
+; =====================================================================
+;                       CPU PERFORMANCE ANALYZER
+; =====================================================================
+
+; CPUPerformanceAnalyzer: analyze the last run, an earlier run or the
+; last comparison from stored data.
+CPUPerformanceAnalyzer PROC USES eax esi
+CP_Loop:
+    ShowMenu txtAnTitle, txtAnMenu
+    INVOKE  ReadRange, ADDR prChoice, 1, 4
+    cmp     eax, 4
+    je      CP_Exit
+    cmp     eax, 1
+    je      CP_Last
+    cmp     eax, 2
+    je      CP_Prev
+    cmp     cmpValid, 0                 ; option 3: last comparison
+    jne     CP_Cmp
+    PrintMsg txtNoCmpAn
+    jmp     CP_Wait
+CP_Cmp:
+    call    AskThreshold
+    mov     eax, CMP_SLOT_A
+    call    AnalyzeSlot
+    mov     eax, CMP_SLOT_B
+    call    AnalyzeSlot
+    jmp     CP_Wait
+CP_Last:
+    cmp     histSerial, 0
+    jne     CP_DoLast
+    PrintMsg txtNoRunAn
+    jmp     CP_Wait
+CP_DoLast:
+    call    AskThreshold
+    mov     eax, lastSlot
+    call    AnalyzeSlot
+    jmp     CP_Wait
+CP_Prev:
+    cmp     histSerial, 0
+    jne     CP_DoPrev
+    PrintMsg txtNoRunAn
+    jmp     CP_Wait
+CP_DoPrev:
+    call    PickRun
+    cmp     esi, -1
+    je      CP_Wait
+    call    AskThreshold
+    mov     eax, esi
+    call    AnalyzeSlot
+CP_Wait:
+    call    Crlf
+    call    WaitMsg
+    jmp     CP_Loop
+CP_Exit:
+    ret
+CPUPerformanceAnalyzer ENDP
+
+; AskThreshold: read the starvation threshold.
+AskThreshold PROC USES eax
+    INVOKE  ReadRange, ADDR prThreshold, 1, 999
+    mov     starveThreshold, eax
+    ret
+AskThreshold ENDP
+
+; ScanSegments: EAX = slot -> aBusy, aIdle, aSwitch from the stored Gantt.
+ScanSegments PROC USES eax ebx ecx edx esi edi
+    mov     esi, eax
+    mov     ebx, esi
+    imul    ebx, MAX_SEGMENTS
+    mov     edi, slotSegCnt[esi*4]
+    mov     aBusy, 0
+    mov     aIdle, 0
+    mov     aSwitch, 0
+    xor     ecx, ecx
+SS_Loop:
+    cmp     ecx, edi
+    jge     SS_Done
+    lea     edx, [ebx+ecx]
+    mov     eax, slotGEnd[edx*4]
+    sub     eax, slotGStart[edx*4]      ; segment length
+    cmp     slotGPid[edx*4], IDLE_PID
+    jne     SS_Busy
+    add     aIdle, eax
+    jmp     SS_Next
+SS_Busy:
+    add     aBusy, eax
+    cmp     ecx, 0                      ; first segment: no predecessor
+    je      SS_Next
+    mov     eax, slotGPid[edx*4]
+    cmp     eax, slotGPid[edx*4 - 4]    ; same process as before?
+    je      SS_Next
+    cmp     slotGPid[edx*4 - 4], IDLE_PID
+    je      SS_Next                     ; coming from IDLE is not a switch
+    inc     aSwitch
+SS_Next:
+    inc     ecx
+    jmp     SS_Loop
+SS_Done:
+    ret
+ScanSegments ENDP
+
+; ScanElapsed: EAX = slot -> aElapsed = latest completion time.
+ScanElapsed PROC USES eax ecx edx esi
+    mov     esi, eax
+    mov     aElapsed, 0
+    xor     ecx, ecx
+SL_Loop:
+    cmp     ecx, slotN[esi*4]
+    jge     SL_Done
+    mov     edx, esi
+    imul    edx, MAX_PROCESSES
+    add     edx, ecx
+    mov     eax, slotCt[edx*4]
+    cmp     eax, aElapsed
+    jle     SL_Next
+    mov     aElapsed, eax
+SL_Next:
+    inc     ecx
+    jmp     SL_Loop
+SL_Done:
+    ret
+ScanElapsed ENDP
+
+; ShowStarvation: EAX = slot. Flag processes whose waiting time is
+; above starveThreshold.
+ShowStarvation PROC USES eax ebx ecx edx esi
+    mov     esi, eax
+    mov     starveCount, 0
+    PrintColored hdrStarve, yellow
+    Border  wStarve, 3
+    SetColor yellow
+    Bar
+    CellStr hPID,    TBL_W
+    CellStr hWT,     TBL_W
+    CellStr hStatus, 18
+    call    Crlf
+    SetColor white
+    Border  wStarve, 3
+    xor     ecx, ecx
+SV_Loop:
+    cmp     ecx, slotN[esi*4]
+    jge     SV_Done
+    mov     eax, esi
+    call    CalculateMetrics
+    Bar
+    CellNum mPid, TBL_W
+    CellNum mWT,  TBL_W
+    mov     eax, mWT
+    cmp     eax, starveThreshold
+    jle     SV_Ok
+    SetColor lightRed
+    CellStr txtStarveYes, 18
+    SetColor white
+    inc     starveCount
+    jmp     SV_Next
+SV_Ok:
+    CellStr txtStarveNo, 18
+SV_Next:
+    call    Crlf
+    inc     ecx
+    jmp     SV_Loop
+SV_Done:
+    Border  wStarve, 3
+    PrintMsg txtFlagged
+    mov     eax, starveCount
+    call    WriteDec
+    call    Crlf
+    ret
+ShowStarvation ENDP
+
+; AnalyzeSlot: EAX = slot. Busy/idle/elapsed time, utilization,
+; throughput, context switches and starvation (stored data only).
+AnalyzeSlot PROC USES eax ebx edx esi edi
+    mov     esi, eax
+    SetColor lightGreen
+    PrintMsg txtAnHeader
+    PrintMsg txtAlgLabel
+    mov     eax, slotAlg[esi*4]
+    call    PrintAlgName
+    call    Crlf
+    SetColor white
+    mov     eax, esi
+    call    ScanSegments
+    mov     eax, esi
+    call    ScanElapsed
+    mov     edx, OFFSET lblBusy
+    mov     eax, aBusy
+    call    ShowStat
+    mov     edx, OFFSET lblIdle
+    mov     eax, aIdle
+    call    ShowStat
+    mov     edx, OFFSET lblElapsed
+    mov     eax, aElapsed
+    call    ShowStat
+    mov     eax, aBusy                  ; check: busy + idle = elapsed
+    add     eax, aIdle
+    cmp     eax, aElapsed
+    jne     AN_Bad
+    PrintMsg txtCheckOk
+    jmp     AN_Util
+AN_Bad:
+    PrintMsg txtCheckBad
+AN_Util:
+    PrintMsg lblUtil                    ; utilization = busy*100 / elapsed
+    mov     eax, aBusy
+    imul    eax, 100
+    mov     edi, aElapsed
+    call    Avg100
+    call    PrintFixed2
+    PrintMsg txtPercent
+    PrintMsg lblThru                    ; throughput = processes / elapsed
+    mov     eax, slotN[esi*4]
+    mov     edi, aElapsed
+    call    Avg100
+    call    PrintFixed2
+    PrintMsg txtPerUnit
+    mov     edx, OFFSET lblSwitch
+    mov     eax, aSwitch
+    call    ShowStat
+    mov     eax, esi
+    call    ShowStarvation
+    PrintMsg txtAnExplain
+    ret
+AnalyzeSlot ENDP
+
+END main
